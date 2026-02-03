@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from pydantic import Field
 from seclab_taskflow_agent.path_utils import mcp_data_dir, log_file_name
 
-from .alert_results_models import AlertResults, AlertFlowGraph, Base
+from .alert_results_models import AlertResults, AlertFlowGraph, Base, ALERT_RESULTS_DIR
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -60,8 +60,6 @@ def remove_line_numbers(location: str) -> str:
     # Keep the first part (file path) and the last two parts (col:col)
     return ":".join(parts[:-4])
 
-
-MEMORY = mcp_data_dir("seclab-taskflows", "report_alert_state", "ALERT_RESULTS_DIR")
 
 
 class ReportAlertStateBackend:
@@ -296,7 +294,7 @@ class ReportAlertStateBackend:
 
 mcp = FastMCP("ReportAlertState")
 
-backend = ReportAlertStateBackend(MEMORY)
+backend = ReportAlertStateBackend(ALERT_RESULTS_DIR)
 
 
 def process_repo(repo):

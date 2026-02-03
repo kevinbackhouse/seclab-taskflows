@@ -16,7 +16,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from seclab_taskflow_agent.path_utils import mcp_data_dir, log_file_name
 
-from .alert_results_models import AlertResults, AlertFlowGraph, Base
+from .alert_results_models import AlertResults, AlertFlowGraph, Base, ALERT_RESULTS_DIR
 
 logging.basicConfig(
     level=logging.DEBUG,
