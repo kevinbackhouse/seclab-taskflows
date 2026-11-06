@@ -1,6 +1,52 @@
 # SPDX-FileCopyrightText: GitHub, Inc.
 # SPDX-License-Identifier: MIT
 
+"""MCP server that runs shell commands inside a managed Docker container.
+
+Configuration is read from the process environment (set per toolbox in the
+toolbox YAML's ``server_params.env`` block):
+
+- ``CONTAINER_IMAGE`` — image to run (required).
+- ``CONTAINER_WORKSPACE`` — host path bind-mounted at ``/workspace`` (optional).
+- ``CONTAINER_WORKSPACE_MOUNT_MODE`` — bind-mount mode for that path, ``rw`` (default)
+  or ``ro``. The default preserves the historical writable mount, because the
+  shipped source-access and SAST prompts build symbol indexes in-tree
+  (``ctags -R .``, ``cscope -R -b``, ``gtags``). Set it to ``ro`` when the
+  workspace should be left pristine — for example when the caller collects the
+  tree afterwards as an artifact and wants a faithful copy of the input. Only a
+  literal ``ro`` selects read-only; any other value mounts read-write.
+- ``CONTAINER_TIMEOUT`` — default per-command timeout in seconds (default 30).
+- ``CONTAINER_PERSIST`` — reuse a deterministic container across runs when truthy.
+- ``CONTAINER_PERSIST_KEY`` — extra key to distinguish persistent containers.
+- ``CONTAINER_NETWORK`` — Docker network for the container. Defaults to
+  ``none`` so the container is egress-locked. Set it to ``bridge``, ``host``, or
+  a user-defined network to enable networking.
+
+Selecting a network mode from a toolbox: the agent passes only the toolbox's
+declared ``env`` entries to this server, so a network mode is selectable at run
+time only if the toolbox exposes the knob. To let callers opt in, add an
+environment variable passthrough line to the toolbox ``env`` block, e.g.::
+
+    CONTAINER_NETWORK: "{{ env('CONTAINER_NETWORK', 'none') }}"
+
+A toolbox that needs networking by default (e.g. recon tooling) can use
+``'bridge'`` as the template default instead. An empty or unset value always
+falls back to ``none``, so isolation cannot be disabled by a blank variable.
+
+Transport:
+
+- ``CONTAINER_SHELL_TRANSPORT`` — MCP transport. Defaults to ``stdio`` for the
+  standard local case where the agent launches this server as a subprocess. Set
+  it to ``http``, ``streamable-http``, or ``sse`` to run as a network-accessible
+  MCP server that a remote agent can connect to.
+- ``CONTAINER_SHELL_HOST`` / ``CONTAINER_SHELL_PORT`` — bind address for the
+  network transports (defaults ``127.0.0.1`` / ``8080``); ignored for ``stdio``.
+
+Which Docker daemon this server drives is orthogonal to the transport: the
+docker CLI honours ``DOCKER_HOST`` from the environment, so pointing this server
+at a specific (e.g. dedicated, isolated) daemon needs no code change here.
+"""
+
 import atexit
 import hashlib
 import json
@@ -27,9 +73,40 @@ _container_name: str | None = None
 
 CONTAINER_IMAGE = os.environ.get("CONTAINER_IMAGE", "")
 CONTAINER_WORKSPACE = mcp_data_dir("seclab-taskflows", "container_shell_workspace", "CONTAINER_WORKSPACE")
+# Bind-mount mode for CONTAINER_WORKSPACE. Defaults to "rw", which preserves
+# the historical behaviour: the shipped source-access and SAST prompts tell the
+# model to build symbol indexes in-tree (`ctags -R .`, `cscope -R -b`, `gtags`),
+# which write into the workspace. Setting this to "ro" is worth doing whenever
+# the caller collects the workspace afterwards as an artifact, since a writable
+# mount makes that artifact agent-influenced rather than a faithful copy of the
+# input. Flipping the default would require redirecting those index outputs
+# first. Only a literal "ro" selects read-only, so a blank or unrecognized
+# value cannot accidentally break a workflow that needs to write.
+CONTAINER_WORKSPACE_MOUNT_MODE = (
+    "ro" if os.environ.get("CONTAINER_WORKSPACE_MOUNT_MODE", "").strip().lower() == "ro" else "rw"
+)
 CONTAINER_TIMEOUT = int(os.environ.get("CONTAINER_TIMEOUT", "30"))
 CONTAINER_PERSIST = os.environ.get("CONTAINER_PERSIST", "").lower() in ("1", "true", "yes")
 CONTAINER_PERSIST_KEY = os.environ.get("CONTAINER_PERSIST_KEY", "")
+# Docker network mode for the container. Defaults to "none" so containers are
+# egress-locked (no network access) unless a caller explicitly opts in by
+# setting CONTAINER_NETWORK to a network name such as "bridge", "host", or a
+# user-defined network. An empty or whitespace-only value falls back to "none"
+# so the isolation default cannot be silently disabled by an unset variable.
+CONTAINER_NETWORK = os.environ.get("CONTAINER_NETWORK", "none").strip() or "none"
+# MCP transport selection. Defaults to "stdio" for the standard local case
+# where the agent launches this server as a subprocess. Set
+# CONTAINER_SHELL_TRANSPORT to "http", "streamable-http", or "sse" to run as a
+# network-accessible server (for example, an isolated sidecar reached by a
+# remote agent); CONTAINER_SHELL_HOST/PORT control the bind address for those
+# transports and are ignored for stdio.
+CONTAINER_SHELL_TRANSPORT = os.environ.get("CONTAINER_SHELL_TRANSPORT", "stdio").strip() or "stdio"
+CONTAINER_SHELL_HOST = os.environ.get("CONTAINER_SHELL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+# Kept as a raw string and parsed to an int lazily in _run_server() so an
+# invalid value only fails when a network transport is actually selected, not at
+# import time under the default stdio transport (where host/port are ignored).
+CONTAINER_SHELL_PORT = os.environ.get("CONTAINER_SHELL_PORT", "8080")
+_SUPPORTED_TRANSPORTS = ("stdio", "http", "streamable-http", "sse")
 
 _DEFAULT_WORKDIR = "/workspace"
 _DOCKER_TIMEOUT = 30
@@ -38,11 +115,26 @@ _DOCKER_TIMEOUT = 30
 def _persistent_name() -> str:
     """Derive a deterministic container name from the image for reuse across tasks.
 
-    Incorporates a hash of the full image reference (and optional
-    CONTAINER_PERSIST_KEY) to avoid collisions between long image names that
-    share a common prefix, or between independent runs of the same image.
+    Incorporates a hash of the full image reference, mounted workspace,
+    configured network mode, and optional CONTAINER_PERSIST_KEY to avoid
+    collisions between independent runs that use the same image with different
+    source trees. Including the network mode ensures a run configured for one
+    network (e.g. the default "none") never reuses a persistent container that
+    was created with a different, more permissive network (e.g. "bridge"),
+    which would otherwise silently re-enable egress.
+
+    The workspace mount mode is included for the same reason, but only when it
+    differs from the "rw" default. Appending it unconditionally would change the
+    derived name for every persistent container that already exists, orphaning
+    each one on upgrade: _start_container() only ever inspects or removes the
+    name it computes, and persistent containers are normally left running, so a
+    non-forcing ``docker rm`` would not collect them either. Omitting the field
+    at the default keeps those names byte-identical, while an explicit "ro" run
+    still gets a distinct name and so cannot reuse a writable container.
     """
-    key_material = CONTAINER_IMAGE
+    key_material = f"{CONTAINER_IMAGE}:{CONTAINER_WORKSPACE}:net={CONTAINER_NETWORK}"
+    if CONTAINER_WORKSPACE_MOUNT_MODE != "rw":
+        key_material += f":ws={CONTAINER_WORKSPACE_MOUNT_MODE}"
     if CONTAINER_PERSIST_KEY:
         key_material += f":{CONTAINER_PERSIST_KEY}"
     digest = hashlib.sha256(key_material.encode()).hexdigest()[:12]
@@ -106,11 +198,11 @@ def _start_container() -> str:
     else:
         name = f"seclab-shell-{uuid.uuid4().hex[:8]}"
 
-    cmd = ["docker", "run", "-d", "--name", name]
+    cmd = ["docker", "run", "-d", "--name", name, "--network", CONTAINER_NETWORK]
     if not CONTAINER_PERSIST:
         cmd.append("--rm")
     if CONTAINER_WORKSPACE:
-        cmd += ["-v", f"{CONTAINER_WORKSPACE}:/workspace"]
+        cmd += ["-v", f"{CONTAINER_WORKSPACE}:/workspace:{CONTAINER_WORKSPACE_MOUNT_MODE}"]
     cmd += [CONTAINER_IMAGE, "tail", "-f", "/dev/null"]
     logging.debug(f"Starting container: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=_DOCKER_TIMEOUT)
@@ -149,7 +241,7 @@ atexit.register(_stop_container)
 
 
 @mcp.tool()
-def shell_exec(
+def container_shell_exec(
     command: Annotated[str, Field(description="Shell command to execute inside the container")],
     timeout: Annotated[int, Field(description="Timeout in seconds")] = CONTAINER_TIMEOUT,
     workdir: Annotated[str, Field(description="Working directory inside the container")] = _DEFAULT_WORKDIR,
@@ -177,5 +269,37 @@ def shell_exec(
     return output
 
 
+def _run_server() -> None:
+    """Run the MCP server using the configured transport.
+
+    Defaults to stdio (local subprocess use). When CONTAINER_SHELL_TRANSPORT
+    selects a network transport, the server binds CONTAINER_SHELL_HOST:PORT so a
+    remote agent can reach it.
+    """
+    if CONTAINER_SHELL_TRANSPORT not in _SUPPORTED_TRANSPORTS:
+        msg = (
+            f"Unsupported CONTAINER_SHELL_TRANSPORT {CONTAINER_SHELL_TRANSPORT!r}; "
+            f"expected one of {', '.join(_SUPPORTED_TRANSPORTS)}"
+        )
+        raise ValueError(msg)
+    if CONTAINER_SHELL_TRANSPORT == "stdio":
+        mcp.run(show_banner=False)
+    else:
+        try:
+            port = int(CONTAINER_SHELL_PORT)
+        except (TypeError, ValueError) as exc:
+            msg = (
+                f"Invalid CONTAINER_SHELL_PORT {CONTAINER_SHELL_PORT!r}; "
+                f"expected an integer for transport {CONTAINER_SHELL_TRANSPORT!r}"
+            )
+            raise ValueError(msg) from exc
+        mcp.run(
+            transport=CONTAINER_SHELL_TRANSPORT,
+            host=CONTAINER_SHELL_HOST,
+            port=port,
+            show_banner=False,
+        )
+
+
 if __name__ == "__main__":
-    mcp.run(show_banner=False)
+    _run_server()

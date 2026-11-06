@@ -1,0 +1,110 @@
+name: Publish Container Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Additional image tag to publish
+        required: false
+        type: string
+  push:
+    branches: [ main ]
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
+    paths:
+      - .github/workflows/publish-container-images.yml
+      - scripts/build_container_images.sh
+      - src/seclab_taskflows/containers/**
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} images
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Log in to GHCR
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: echo "${GITHUB_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+    - name: Build and push single-architecture images
+      env:
+        ARCH: ${{ matrix.arch }}
+      run: |
+        set -euo pipefail
+
+        arch_tag="sha-${GITHUB_SHA::12}-${ARCH}"
+
+        export PUSH=1
+        export IMAGE_TAGS="${arch_tag}"
+        # derived images must build on the base pushed by this same job
+        export BASE_IMAGE="ghcr.io/githubsecuritylab/seclab-shell-base:${arch_tag}"
+
+        ./scripts/build_container_images.sh all
+
+  publish:
+    name: Publish multi-architecture images
+    needs: build
+    runs-on: ubuntu-26.04
+
+    steps:
+    - name: Log in to GHCR
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: echo "${GITHUB_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+    - name: Combine per-architecture images into manifest lists
+      env:
+        CUSTOM_TAG: ${{ github.event.inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        short_sha="${GITHUB_SHA::12}"
+        tags=("sha-${short_sha}")
+
+        if [[ "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
+          tags+=("latest")
+        fi
+
+        if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          tags+=("${GITHUB_REF_NAME}")
+        fi
+
+        if [[ -n "${CUSTOM_TAG}" ]]; then
+          tags+=("${CUSTOM_TAG}")
+        fi
+
+        images=(
+          ghcr.io/githubsecuritylab/seclab-shell-base
+          ghcr.io/githubsecuritylab/seclab-shell-malware-analysis
+          ghcr.io/githubsecuritylab/seclab-shell-network-analysis
+          ghcr.io/githubsecuritylab/seclab-shell-source-access
+          ghcr.io/githubsecuritylab/seclab-shell-sast
+        )
+
+        for image in "${images[@]}"; do
+          args=()
+          for tag in "${tags[@]}"; do
+            args+=(--tag "${image}:${tag}")
+          done
+          docker buildx imagetools create "${args[@]}" \
+            "${image}:sha-${short_sha}-amd64" \
+            "${image}:sha-${short_sha}-arm64"
+        done

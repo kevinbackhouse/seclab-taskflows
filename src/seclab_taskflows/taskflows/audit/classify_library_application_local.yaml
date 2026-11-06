@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+seclab-taskflow-agent:
+  filetype: taskflow
+  version: "1.0"
+model_config: seclab_taskflows.configs.model_config
+
+globals:
+  repo:
+  use_advisory:
+# Taskflow to analyze the general contextual information of a project and classify the different applications within it
+taskflow:
+  - task:
+      must_complete: true
+      exclude_from_context: true
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      model: general_tasks
+      user_prompt: |
+        Fetch the components of the repo {{ globals.repo }}
+      toolboxes:
+        - seclab_taskflows.toolboxes.repo_context
+  - task:
+      must_complete: true
+      repeat_prompt: true
+      async: true
+      agents:
+        - seclab_taskflows.personalities.web_application_security_expert
+      model: code_analysis
+      user_prompt: |
+        The component is in the repo {{ result.repo }} and it has component id {{ result.app_id }} and location {{ result.location }}.
+        The notes of the component is as follows.
+
+        {{ result.notes }}
+
+        Fetch the entry points, web entry points of the component, then the user actions of this component.
+        Based on the entry points, web entry points, components, user actions and README.md and if available, SECURITY.md in the {{ globals.repo }},
+        can you tell me what type of application this repo is and what kind of security boundary it has.
+        Based on this, determine whether the component is likely to have security problems.
+
+        {% if globals.use_advisory == 'true' %}
+        {% include 'seclab_taskflows.prompts.audit.known_security_advisories' %}
+        {% endif %}
+
+        Identify the most likely security problems in the component. Your task is not to carry out a full audit, but to
+        identify the main risk in the component so that further analysis can be carried out.
+        Do not be too specific about an issue, but rather craft your report based on the general functionality and type of
+        the component and state the most likely risk, instead of risk specific to the implementation of the component.
+        However, you should still
+        take care not to include issues that are of low severity or require unrealistic attack scenarios such as misconfiguration
+        or an already compromised system.
+
+        Base your decision on:
+        - Is this component likely to take untrusted user input? For example, remote web requests or IPC, RPC calls?
+        - What is the intended purpose of this component and its functionality? Does it allow high privileged actions?
+        Is it intended to provide such functionalities for all users? Or is there complex access control logic involved?
+        - The component itself may also have its own `README.md` (or a subdirectory of it may have a `README.md`). Take
+        a look at those files to help understand the functionality of the component.
+
+        For example, an Admin UI/dashboard may be susceptible to client side Javascript vulnerabilities such as XSS, CSRF.
+        An authentication/authorization component may be susceptible to IDOR, bypasses etc.
+        Components that grant user access to data may require access control or authentication. It may also require
+        ownership checks. For example,
+        a web frontend may allow users to access their own content and admins to access all content, but users should not
+        be able to access another users' content in general.
+
+        We're looking for more concrete and serious security issues that affects system integrity or
+        lead to information leak, so please do not include issues like brute force, Dos, log injection etc.
+
+        Also do not include issues that require the system to be already compromised, such as issues that rely on malicious
+        configurations, stolen credentials, misconfiguration etc.
+
+        For each scenario, consider what privilege and access the attacker needs to gain and do not include issues that
+        require high privilege or access to the system.
+
+        Your task is to identify risk rather than properly audit and find security issues. Do not look too much into
+        the implementation or scrutinize the security measures such as access control and sanitizers at this stage.
+        Instead, report more general risks that are associated with the type of component
+        that you are looking at.
+
+        It is not your task to audit the security measures, but rather just to identify the risks and suggest some issues
+        that is worth auditing.
+
+        Reflect on your notes and check that the attack scenario meets the above requirements. Exclude low severity issues or
+        issues that require unrealistic circumstances such as misconfiguration or stolen credentials etc.
+        It is ok to conclude that the component is not likely to have security issues.
+
+        If you think the issues satisfy the criteria, store a component issue entry for each type of issue identified.
+      toolboxes:
+        - seclab_taskflows.toolboxes.repo_context
+        - seclab_taskflows.toolboxes.container_shell_source_access
+        - seclab_taskflow_agent.toolboxes.memcache
+  - task:
+      must_complete: true
+      exclude_from_context: true
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      model: general_tasks
+      user_prompt: |
+        Fetch the components of the repo {{ globals.repo }}
+      toolboxes:
+        - seclab_taskflows.toolboxes.repo_context
+  - task:
+      must_complete: true
+      repeat_prompt: true
+      async: true
+      name: analyze_security_entry_points
+      agents:
+        - seclab_taskflows.personalities.web_application_security_expert
+      model: code_analysis
+      user_prompt: |
+        The component is in the repo {{ result.repo }} and it has component id {{ result.app_id }} and location {{ result.location }}.
+        The notes of the component is as follows.
+
+        {{ result.notes }}
+
+        Fetch the security entry points component, then the user actions of this component.
+        Based on the security entry points, components, user actions and README.md and if available, SECURITY.md in the {{ globals.repo }},
+        can you tell me what type of application this repo is and what kind of security boundary it has.
+
+        For each security entry point, identify the type of the security entry point and its functionality. 
+        These entry points should be performing some kind of security sensitive operations, such as authentication, authorization, input validation, sanitization, escaping etc.
+        Identify the functionality of the entry point and what kind of issue may arise if the implementation is flawed. 
+        For example, an authentication entry point may be susceptible to authentication bypass, 
+        an input validation entry point may be susceptible to injection issues if the input is not properly sanitized, 
+        an authorization entry point may be susceptible to IDOR or access control bypass if there are no proper access control checks.
+        This task is only to identify the potential risks and issues that may arise from the type of the security entry point, 
+        rather than auditing the implementation of the entry point, so do not be too specific about the issue, and do not 
+        audit the implementation, just identify the potential risks based on the type and functionality of the security entry point.
+        However, you should still take care not to include issues that are of low severity or require
+        unrealistic attack scenarios such as misconfiguration or an already compromised system, or issues that requires 
+        attacker control of trusted inputs such as whitelist or blacklist bypass that requires the attacker 
+        to be able to modify the whitelist or blacklist.
+
+        Reflect on your notes and check that the attack scenario meets the above requirements. Exclude low severity issues or
+        issues that require unrealistic circumstances such as misconfiguration or stolen credentials etc.
+        It is ok to conclude that the component is not likely to have security issues.
+
+        If you think the issues satisfy the criteria, store a component issue entry for each type of issue identified.
+        
+      toolboxes:
+        - seclab_taskflows.toolboxes.repo_context
+        - seclab_taskflows.toolboxes.container_shell_source_access
+        - seclab_taskflow_agent.toolboxes.memcache
