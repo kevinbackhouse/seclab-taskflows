@@ -35,6 +35,11 @@ build_sast() {
     docker build -t seclab-shell-sast:latest "${CONTAINERS_DIR}/sast/"
 }
 
+build_VEA() {
+    echo "Building seclab-shell-vea..."
+    docker build -t seclab-shell-vea:latest "${CONTAINERS_DIR}/VEA/"
+}
+
 target="${1:-all}"
 
 case "$target" in
@@ -53,11 +58,16 @@ case "$target" in
         build_base
         build_sast
         ;;
+    VEA)
+        build_base
+        build_VEA
+        ;;
     all)
         build_base
         build_malware
         build_network
         build_sast
+        build_VEA
         ;;
     *)
         echo "Unknown target: $target" >&2

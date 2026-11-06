@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+# To run:
+# python -m seclab_taskflow_agent -t seclab_taskflows.taskflows.VEA.VEA_python -g dependabot_pull_request=https://github.com/GitHubSecurityLab/seclab-taskflow-agent/pull/222
+
+seclab-taskflow-agent:
+  filetype: taskflow
+  version: "1.0"
+
+globals:
+  dependabot_pull_request:
+
+model_config: seclab_taskflows.configs.model_config
+
+taskflow:
+  - task:
+      must_complete: true
+      headless: true
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      toolboxes:
+        - seclab_taskflows.toolboxes.VEA_context
+        - seclab_taskflow_agent.toolboxes.github_official
+      user_prompt: |
+        Read the description of the pull request {{ globals.dependabot_pull_request }}.
+        If the description is not written by dependabot, it means that the user gave us the wrong PR to analyze,
+        so print an error message and stop.
+        For each package mentioned in the description, store the following details in the VEA_context:
+        * The CVE identifier of the vulnerability being fixed.
+        * The package name of the vulnerable dependency being fixed.
+        * The version number of the vulnerable dependency being fixed.
+        * The dependabot pull request URL {{ globals.dependabot_pull_request }}.
+
+  - task:
+      must_complete: true
+      exclude_from_context: true
+      model: general_tasks
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      user_prompt: |
+          Get the list of vulnerable dependencies for pull request {{ globals.dependabot_pull_request }}.
+      toolboxes:
+        - seclab_taskflows.toolboxes.VEA_context
+
+  - task:
+      model: general_tasks
+      must_complete: false
+      repeat_prompt: true
+      headless: true
+      name: path analysis
+      description: Find information about the CVE.
+      agents:
+        - seclab_taskflows.personalities.auditor
+      toolboxes:
+        - seclab_taskflows.toolboxes.ghsa
+        - seclab_taskflow_agent.toolboxes.github_official
+        - seclab_taskflows.toolboxes.VEA_context
+      user_prompt: |
+        Use the GitHub Advisory Database (https://github.com/advisories) to search for information about {{ result.cve_id }}.
+        Do not use the VEA_context to search for information about {{ result.cve_id }}.
+        Try to find information about the source location(s) of the vulnerability. For example, the advisory might mention
+        the module name or function name. If the advisory doesn't contain sufficient information, then check the
+        the release notes of the fixed version, which might mention the pull request that fixed the vulnerability.
+        You can also try searching the commit history for a fix commit that was included in the fixed version.
+        Store the information about {{ result.cve_id }} in the VEA_context. For the source location(s), store
+        your best guess, and use the "source_location_evidence" key to explain where the source location information came from,
+        and how reliable the evidence is that the source location information is correct.
+
+  - task:
+      must_complete: true
+      headless: true
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      toolboxes:
+        - seclab_taskflow_agent.toolboxes.github_official
+        - seclab_taskflows.toolboxes.container_shell_VEA
+        - seclab_taskflows.toolboxes.VEA_context
+      user_prompt: |
+        Visit the GitHub page for the pull request {{ globals.dependabot_pull_request }} and determine
+        the GitHub repository and target branch of the pull request.
+        
+        In the container, run each of these steps:
+        * Run "rm -rf /workspace/*; python3 -m venv /workspace/venv"
+        * Use "git clone -b <TARGET_BRANCH> <REPO_URL> /workspace/code" to clone the repository and checkout the appropriate branch.
+        * Run "/opt/VEA/setup.sh" to analyze the module dependencies and generate the module graph.
+
+        When using the shell_exec function, always use the default timeout and workdir.
+
+  - task:
+      must_complete: true
+      exclude_from_context: true
+      model: general_tasks
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      user_prompt: |
+          Get the list of vulnerable dependencies for pull request {{ globals.dependabot_pull_request }}.
+      toolboxes:
+        - seclab_taskflows.toolboxes.VEA_context
+
+  - task:
+      model: code_analysis
+      must_complete: false
+      repeat_prompt: true
+      headless: true
+      name: path analysis
+      description: Look for code paths from the main package to the vulnerable dependency.
+      agents:
+        - seclab_taskflows.personalities.auditor
+      toolboxes:
+        - seclab_taskflows.toolboxes.container_shell_VEA
+        - seclab_taskflows.toolboxes.VEA_context
+      user_prompt: |
+        In the container, the GitHub repository from pull request {{ globals.dependabot_pull_request }} is already checked out at /workspace/code.
+        A python virtual environment is also already set up in /workspace/venv, and "pip install -e" has been run to install the repository in editable mode and pull its dependencies.
+        Your goal is to find possible code paths that could trigger {{ result.cve_id }} in the vulnerable dependency {{ result.package_name }}.
+        Use the VEA_context to get information about {{ result.cve_id }}. The "source_location" key will tell you the names of the
+        python modules that are believed to be responsible for the vulnerability.
+
+        In the container, run "/workspace/venv/bin/python /opt/VEA/shortpaths.py /workspace/modulelist.txt /workspace/modulegraph.csv /workspace/paths.txt SOURCE_LOCATION; cat /workspace/paths.txt",
+        where SOURCE_LOCATION is the name of one of the python modules that is believed to be responsible for the vulnerability.
+        Note that shortpaths.py needs the source location to be in the form of a python module name (e.g., "requests.api" instead of "requests/api.py").
+        If shortpaths.py returns no results, try a prefix of the module name, for example "requests" instead of "requests.api".
+        If there are still no results, report that no paths were found and stop.
+
+        When using the shell_exec function, always use the default timeout and workdir.
+
+        For each path found, store it in the VEA_context using the store_candidate_reachable_path tool.
+        The path_found_by field should say: "Found by static analysis of the module import graph".
+
+  - task:
+      must_complete: true
+      exclude_from_context: true
+      model: general_tasks
+      agents:
+        - seclab_taskflow_agent.personalities.assistant
+      user_prompt: |
+          Get the list of candidate reachable paths for pull request {{ globals.dependabot_pull_request }}.
+      toolboxes:
+        - seclab_taskflows.toolboxes.VEA_context
+
+  - task:
+      model: code_analysis
+      must_complete: false
+      repeat_prompt: true
+      headless: true
+      name: path analysis
+      description: Verify reachability
+      agents:
+        - seclab_taskflows.personalities.auditor
+      toolboxes:
+        - seclab_taskflows.toolboxes.container_shell_VEA
+        - seclab_taskflows.toolboxes.VEA_context
+      user_prompt: |
+        In the container, the GitHub repository from pull request {{ globals.dependabot_pull_request }} is already checked out at /workspace/code.
+        A python virtual environment is also already set up in /workspace/venv, and "pip install -e" has been run to install the repository in editable mode and pull its dependencies.
+        Use the VEA_context to get the CVE information for {{ globals.dependabot_pull_request }}.
+        Your goal is to find a code path that could trigger the vulnerability in {{ result.package_name }}.
+        This is a candidate import path to the vulnerable dependency: {{ result.path }}.
+        The candidate path was found by: {{ result.path_found_by }}.
+        Analyze the source code in the corresponding python files to determine if there is a
+        code path from the main package to the vulnerable module that could trigger the vulnerability.
+        If you find a viable looking path, attempt to build a unit test that will trigger it.
+        Report back whether you found a viable path and whether you were able to build a unit test to trigger it.

@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: GitHub, Inc.
+# SPDX-License-Identifier: MIT
+
+seclab-taskflow-agent:
+  filetype: toolbox
+  version: "1.0"
+
+server_params:
+  kind: stdio
+  command: python
+  args: ["-m", "seclab_taskflows.mcp_servers.container_shell"]
+  env:
+    CONTAINER_IMAGE: "seclab-shell-vea:latest"
+    CONTAINER_WORKSPACE: "{{ env('CONTAINER_WORKSPACE', required=False) }}"
+    CONTAINER_TIMEOUT: "{{ env('CONTAINER_TIMEOUT', '60') }}"
+    CONTAINER_PERSIST: "{{ env('CONTAINER_PERSIST', required=False) }}"
+    CONTAINER_PERSIST_KEY: "{{ env('CONTAINER_PERSIST_KEY', required=False) }}"
+    LOG_DIR: "{{ env('LOG_DIR') }}"
+
+confirm:
+  - shell_exec
+
+server_prompt: |
+  ## Container Shell (VEA)
+  You have access to an isolated Docker container for static analysis and code exploration.
+  Source code is available at /workspace. All tools run inside the container.
+  Tools are available at /opt/VEA.

@@ -12,7 +12,7 @@ from typing import Annotated
 
 from fastmcp import FastMCP
 from pydantic import Field
-from seclab_taskflow_agent.path_utils import log_file_name
+from seclab_taskflow_agent.path_utils import log_file_name, mcp_data_dir
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -26,7 +26,7 @@ mcp = FastMCP("ContainerShell")
 _container_name: str | None = None
 
 CONTAINER_IMAGE = os.environ.get("CONTAINER_IMAGE", "")
-CONTAINER_WORKSPACE = os.environ.get("CONTAINER_WORKSPACE", "")
+CONTAINER_WORKSPACE = mcp_data_dir("seclab-taskflows", "container_shell_workspace", "CONTAINER_WORKSPACE")
 CONTAINER_TIMEOUT = int(os.environ.get("CONTAINER_TIMEOUT", "30"))
 CONTAINER_PERSIST = os.environ.get("CONTAINER_PERSIST", "").lower() in ("1", "true", "yes")
 CONTAINER_PERSIST_KEY = os.environ.get("CONTAINER_PERSIST_KEY", "")
@@ -92,7 +92,7 @@ def _start_container() -> str:
     if not CONTAINER_IMAGE:
         msg = "CONTAINER_IMAGE is not set — cannot start container"
         raise RuntimeError(msg)
-    if CONTAINER_WORKSPACE and ":" in CONTAINER_WORKSPACE:
+    if CONTAINER_WORKSPACE and ":" in CONTAINER_WORKSPACE.as_posix():
         msg = f"CONTAINER_WORKSPACE must not contain a colon: {CONTAINER_WORKSPACE!r}"
         raise RuntimeError(msg)
 
@@ -173,6 +173,7 @@ def shell_exec(
     if result.stderr:
         output += result.stderr
     output += f"[exit code: {result.returncode}]"
+    logging.debug(f"Output: {output}")
     return output
 
 
